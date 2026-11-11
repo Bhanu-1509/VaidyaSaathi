@@ -1,0 +1,146 @@
+# Run from the project root (the folder that contains auth-service/, doctor-service/, ...):
+#   docker compose up --build
+name: vaidyasaathi
+
+x-service: &service
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+x-secrets: &secrets
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+  SERVICE_TO_SERVICE_TOKEN: ${SERVICE_TO_SERVICE_TOKEN:?Set SERVICE_TO_SERVICE_TOKEN in .env}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "127.0.0.1:5433:5432"   # 5433 so it does not clash with a Postgres installed on your PC
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  notification-service:
+    restart: unless-stopped
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: notification-service } }
+    environment:
+      SERVICE_TO_SERVICE_TOKEN: ${SERVICE_TO_SERVICE_TOKEN}
+      PORT: "8005"
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+    ports: ["127.0.0.1:8005:8005"]
+
+  auth-service:
+    <<: *service
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: auth-service } }
+    depends_on:
+      postgres: { condition: service_healthy }
+      notification-service: { condition: service_started }
+    environment:
+      <<: *secrets
+      PORT: "8000"
+      AUTH_DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/vaidya_auth_db
+      NOTIFICATION_SERVICE_URL: http://notification-service:8005
+      SHOW_DEV_OTP: ${SHOW_DEV_OTP:-true}
+    ports: ["127.0.0.1:8000:8000"]
+
+  doctor-service:
+    <<: *service
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: doctor-service } }
+    environment:
+      <<: *secrets
+      PORT: "8001"
+      DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/doctor_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      APPOINTMENT_SERVICE_URL: http://appointment-service:8003
+    ports: ["127.0.0.1:8001:8001"]
+
+  patient-service:
+    <<: *service
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: patient-service } }
+    environment:
+      <<: *secrets
+      PORT: "8002"
+      PATIENT_DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/patient_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+    ports: ["127.0.0.1:8002:8002"]
+
+  appointment-service:
+    <<: *service
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: appointment-service } }
+    environment:
+      <<: *secrets
+      PORT: "8003"
+      APPOINTMENT_DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/appointment_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      DOCTOR_SERVICE_URL: http://doctor-service:8001
+      PATIENT_SERVICE_URL: http://patient-service:8002
+      SCHEDULING_SERVICE_URL: http://scheduling-service:8004
+      DEFAULT_APPOINTMENT_DURATION_MINUTES: "30"
+    ports: ["127.0.0.1:8003:8003"]
+
+  scheduling-service:
+    restart: unless-stopped
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: scheduling-service } }
+    environment:
+      SERVICE_TO_SERVICE_TOKEN: ${SERVICE_TO_SERVICE_TOKEN}
+      PORT: "8004"
+      DOCTOR_SERVICE_URL: http://doctor-service:8001
+      APPOINTMENT_SERVICE_URL: http://appointment-service:8003
+      DEFAULT_APPOINTMENT_DURATION_MINUTES: "30"
+    ports: ["127.0.0.1:8004:8004"]
+
+  lab-service:
+    <<: *service
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: lab-service } }
+    depends_on:
+      postgres: { condition: service_healthy }
+      auth-service: { condition: service_started }
+    environment:
+      <<: *secrets
+      PORT: "8006"
+      LAB_DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/lab_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+    ports: ["127.0.0.1:8006:8006"]
+
+  ai-service:
+    restart: unless-stopped
+    build: { context: ., dockerfile: docker/Dockerfile, args: { SERVICE: ai-service } }
+    environment:
+      PORT: "8007"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      DOCTOR_SERVICE_URL: http://doctor-service:8001
+      SCHEDULING_SERVICE_URL: http://scheduling-service:8004
+      LAB_SERVICE_URL: http://lab-service:8006
+    ports: ["127.0.0.1:8007:8007"]
+
+  frontend:
+    restart: unless-stopped
+    build: ./vaidyasaathi-frontend
+    depends_on: [auth-service, doctor-service, patient-service, appointment-service, scheduling-service, lab-service, ai-service]
+    environment:
+      BIND: 0.0.0.0
+      API_AUTH_URL: http://auth-service:8000
+      API_DOCTOR_URL: http://doctor-service:8001
+      API_PATIENT_URL: http://patient-service:8002
+      API_APPOINTMENT_URL: http://appointment-service:8003
+      API_SCHEDULE_URL: http://scheduling-service:8004
+      API_LAB_URL: http://lab-service:8006
+      API_AI_URL: http://ai-service:8007
+    ports: ["127.0.0.1:5173:5173"]
+
+volumes:
+  pgdata:
